@@ -1,0 +1,61 @@
+# bots/ofelia-vps.env — example for a bot that posts into a Telegram forum group
+#
+# This template shows the new TOPIC_IDS variable. Place it at
+# ~/.config/notify-agent/bots/<name>.env and `chmod 600` it.
+#
+# Reference for the full multi-bot model:
+# see ../README.md and the v1.0 multi-bot contract in the original
+# sgm-ai-skills repo (skills/notify-agent/references/setup.md).
+
+# ─── Required ────────────────────────────────────────────────────────────────
+
+# From @BotFather (/newbot).
+BOT_TOKEN=...
+
+# Username of the bot (without the @). Used only for display.
+BOT_USERNAME=ofelia_sgm_vpsagent_bot
+
+# Logical project keys this bot owns. Comma-separated. Each key here is what
+# you pass to `notify-agent --project ...`. At least one is required.
+PROJECT_KEY=ofelia,ofelia-ui
+
+# ─── Required for group delivery ─────────────────────────────────────────────
+
+# The chat_id of the Telegram supergroup with Topics enabled. Negative number
+# starting with -100 for supergroups.
+CHAT_ID=-1004320132331
+
+# ─── Forum-topic routing (new in this fork) ──────────────────────────────────
+
+# Maps each project_key above to its message_thread_id in the supergroup.
+# Format: comma-separated key:value pairs.
+#
+#   key   = one of the project_keys in PROJECT_KEY (exact match)
+#   value = the message_thread_id (an integer Telegram assigns to each topic)
+#
+# To find the message_thread_id of a topic in your client:
+#   - Open the topic in Telegram Desktop or web
+#   - Right-click any message → "Copy Link"
+#   - The URL is https://t.me/c/<group_id>/<topic_id>/<message_id>
+#     (or just /<message_id> for messages in General, where there is no topic_id)
+#   - The number right after the group_id is your message_thread_id
+#
+# If a project_key is NOT listed here, notifications for that key are sent
+# without message_thread_id, which causes them to land in the chat's
+# "General" topic. This is the desired behavior for a `general` catch-all.
+TOPIC_IDS=ofelia:4,ofelia-ui:4
+
+# ─── Optional / display ──────────────────────────────────────────────────────
+
+# Human label in /health and /bots responses. Defaults to the .env filename.
+DISPLAY_NAME=Ofelia VPS
+
+# How verbose --full payloads are delivered:
+#   never      → drop --full entirely (default)
+#   always     → send --full as a second message (chunked at 4000 chars)
+#   file_only  → send --full as a .txt document via sendDocument
+FULL_MODE=always
+
+# Shared secret for the CLI → server authentication. The server-wide key in
+# ~/.config/notify-agent/bot.env takes precedence if set.
+API_KEY=
