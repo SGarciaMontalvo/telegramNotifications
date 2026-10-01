@@ -270,13 +270,19 @@ def call_telegram_sendMessage(bot_token, chat_id, text, reply_markup=None,
     message_thread_id (optional): when set, Telegram posts the message into
     the corresponding forum topic of the chat. When None, the message lands
     in the chat's "General" (or the only chat for non-forum groups).
+
+    parse_mode: passed to Telegram only when truthy. Telegram rejects an
+    explicit `parse_mode: null` with 400 "unsupported parse_mode" — it
+    expects either a valid mode string (HTML, MarkdownV2, Markdown) or
+    the field absent.
     """
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": parse_mode,
         "disable_notification": disable_notification,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     if message_thread_id is not None:
