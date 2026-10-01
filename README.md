@@ -75,15 +75,44 @@ for messages that don't have a dedicated topic.
 |---|---|
 | Server extended with `TOPIC_IDS` | ✅ done |
 | Unit + integration tests passing (19/19) | ✅ done |
-| Docs (`references/setup.md`, `bots-env.example`) | ⏳ pending |
-| Backed up production bots to `bots/legacy/` | ⏳ pending |
-| Production `.env` files created | ⏳ pending |
-| Server restarted with new config | ⏳ pending |
-| End-to-end smoke (push to all topics) | ⏳ pending |
-| Merge back into `sgm-ai-skills` | ⏳ pending |
+| Docs (`references/setup.md`, `bots-env.example`) | ✅ done |
+| Backed up production bots to `bots/legacy/` | ✅ done |
+| Production `.env` files created | ✅ done |
+| Server restarted with new config | ✅ done |
+| End-to-end smoke (push to all topics) | ✅ done |
+| Merge back into `sgm-ai-skills` | ❌ not planned — see below |
 
-See `/home/deploy/.pi/odd/tasks/dual-channel-notifications.md` (on the VPS,
-not in this repo) for the full task plan and acceptance criteria.
+**Deployed to production on 2026-10-01.** Sergio confirmed visually that
+all five smoke-test messages landed in their respective topics (Ofelia,
+Brainstorm, Bitácora, General) inside the "Agentes VPS" supergroup
+(chat_id=-1004320132331).
+
+### Production topology
+
+| Bot | Project keys | Chat | Topic |
+|---|---|---|---|
+| `ofelia_sgm_vpsagent_bot` | `ofelia`, `ofelia-ui` | Agentes VPS | Topic 4 |
+| `brainstorm_sgm_vpsagent_bot` | `brainstorm` | Agentes VPS | Topic 6 |
+| `bitacora_sgm_vpsagent_bot` | `bitacora` | Agentes VPS | Topic 8 |
+| `general_sgm_vpsagent_bot` | `general` | Agentes VPS | General (no thread) |
+| (placeholder) | `tareas` | Agentes VPS | Topic 12 (BotFather limit) |
+| `Ofelia_sgm_agent_bot` | `ia_conversacional` | 1:1 with Sergio | — |
+| `varian_sgm_agent_bot` | `varian` | 1:1 with Sergio | — |
+
+The production binary lives at
+`/home/deploy/.local/share/notify-agent/notify-bot.py`, distinct from
+the upstream skill path under `~/.config/opencode/skills/`.
+
+### Decision: stay in this repo, do not merge back
+
+Sergio chose to keep this as the canonical repository for the feature
+rather than feeding it back into `sgm-ai-skills`. The upstream skill
+remains at v1.0 (no topic support); the multi-bot topology in
+`sgm-ai-skills` continues to work for any consumer that doesn't want
+forum groups. Future development of the topic-aware version lives here.
+
+See `/home/deploy/.pi/odd/tasks/dual-channel-notifications.md` on the
+VPS for the full task plan, acceptance criteria, and closure notes.
 
 ## Why a separate repo?
 
