@@ -226,6 +226,42 @@ def _tg_extract_message_id(body_str):
         return 0
 
 
+def _parse_telegram_error(body_str):
+    """Parse a Telegram error response body and return (error_code, retry_after).
+
+    error_code is a short stable identifier (string) that callers can switch
+    on, e.g. "rate_limited", "chat_not_found", "message_too_long",
+    "bot_blocked", "forbidden". When the body has no parseable description,
+    returns ("telegram_error", None).
+    """
+    if not body_str:
+        return "telegram_error", None
+    try:
+        j = json.loads(body_str)
+    except Exception:
+        return "telegram_error", None
+    if j.get("ok"):
+        return None, None
+    desc = (j.get("description") or "").lower()
+    params = j.get("parameters") or {}
+    retry = params.get("retry_after")
+    if "too many requests" in desc or retry is not None:
+        return "rate_limited", int(retry) if retry is not None else None
+    if "chat not found" in desc:
+        return "chat_not_found", None
+    if "message is too long" in desc or "message text is too long" in desc:
+        return "message_too_long", None
+    if "message thread not found" in desc:
+        return "thread_not_found", None
+    if "bot was blocked" in desc or "bot was kicked" in desc:
+        return "bot_blocked", None
+    if "forbidden" in desc:
+        return "forbidden", None
+    if "bad request" in desc:
+        return "bad_request", None
+    return "telegram_error", None
+
+
 def call_telegram_sendMessage(bot_token, chat_id, text, reply_markup=None,
                               parse_mode="HTML", disable_notification=False,
                               message_thread_id=None):
@@ -816,14 +852,19 @@ class Bot:
     # -- Telegram outbound wrappers ------------------------------------------
 
     def send_message(self, text, reply_markup=None, parse_mode=None,
-                     disable_notification=False):
+                     disable_notification=False, message_thread_id=None):
         return call_telegram_sendMessage(
             self.bot_token, self.chat_id, text,
             reply_markup=reply_markup, parse_mode=parse_mode,
             disable_notification=disable_notification,
+            message_thread_id=message_thread_id,
         )
 
-    def edit_message(self, message_id, text, reply_markup=None, parse_mode=None):
+    def edit_message(self, message_id, text, reply_markup=None, parse_mode=None,
+                     message_thread_id=None):
+        """editMessageText. Telegram's editMessageText does NOT accept
+        message_thread_id, but the chat_id is the same as the original
+        message so the edit lands in the right topic automatically."""
         return edit_message_text(
             self.bot_token, self.chat_id, message_id, text,
             reply_markup=reply_markup, parse_mode=parse_mode,
@@ -831,6 +872,65 @@ class Bot:
 
     def answer_callback(self, callback_query_id, text=""):
         return answer_callback(self.bot_token, callback_query_id, text)
+
+    def send_photo(self, photo_url, caption=None, message_thread_id=None,
+                   reply_markup=None):
+        """sendPhoto via URL. Returns (code, body, message_id, error_code)."""
+        payload = {
+            "chat_id": self.chat_id,
+            "photo": photo_url,
+        }
+        if caption is not None:
+            payload["caption"] = caption[:1024]
+        if message_thread_id is not None:
+            payload["message_thread_id"] = int(message_thread_id)
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        code, body = _tg_call_json(self.bot_token, "sendPhoto", payload)
+        mid = _tg_extract_message_id(body)
+        err_code, retry = _parse_telegram_error(body)
+        return code, body, mid, err_code, retry
+
+    def send_voice(self, voice_url, duration_seconds=None, caption=None,
+                   message_thread_id=None, reply_markup=None):
+        """sendVoice via URL. duration_seconds is optional. Returns the same
+        tuple shape as send_photo."""
+        payload = {
+            "chat_id": self.chat_id,
+            "voice": voice_url,
+        }
+        if duration_seconds is not None:
+            payload["duration"] = int(duration_seconds)
+        if caption is not None:
+            payload["caption"] = caption[:1024]
+        if message_thread_id is not None:
+            payload["message_thread_id"] = int(message_thread_id)
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        code, body = _tg_call_json(self.bot_token, "sendVoice", payload)
+        mid = _tg_extract_message_id(body)
+        err_code, retry = _parse_telegram_error(body)
+        return code, body, mid, err_code, retry
+
+    def send_document(self, document_url, filename=None, caption=None,
+                      message_thread_id=None, reply_markup=None):
+        """sendDocument via URL. Telegram does NOT accept message_thread_id
+        in sendDocument in the current Bot API surface; the document lands
+        in the chat General regardless (callers should warn their users)."""
+        payload = {
+            "chat_id": self.chat_id,
+            "document": document_url,
+        }
+        if filename is not None:
+            payload["filename"] = filename
+        if caption is not None:
+            payload["caption"] = caption[:1024]
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        code, body = _tg_call_json(self.bot_token, "sendDocument", payload)
+        mid = _tg_extract_message_id(body)
+        err_code, retry = _parse_telegram_error(body)
+        return code, body, mid, err_code, retry
 
     # -- chat_id resolution ----------------------------------------------------
 
@@ -1290,6 +1390,7 @@ class MultiBotServer:
         self.bots = {}                  # bot_name -> Bot
         self.project_to_bot = {}        # project_key -> bot_name (1:1 in v1.0)
         self.api_key = ""
+        self.dispatch_token = ""        # Bearer token for POST /dispatch (ofelia-ui)
         self._server = None
         self.start_ts = time.time()
         self.bots_dir = bots_dir or BOTS_DIR_DEFAULT
@@ -1300,6 +1401,10 @@ class MultiBotServer:
         api_key priority:
           1. ~/.config/notify-agent/bot.env  (legacy file, preserved)
           2. First bot's API_KEY  (new v1.0 way)
+
+        dispatch_token: read from env var NOTIFY_BOT_DISPATCH_TOKEN or from
+        legacy bot.env. If empty, the /dispatch endpoint is disabled (returns
+        503 to all callers).
         """
         # Re-resolve paths each call so HOME changes (tests, sudo contexts)
         # are picked up correctly.
@@ -1340,6 +1445,22 @@ class MultiBotServer:
                 logger.warning("no API_KEY in legacy %s and bot %r has empty API_KEY",
                                LEGACY_ENV_PATH, bots[0].name)
 
+        # dispatch_token resolution:
+        #   1. env var NOTIFY_BOT_DISPATCH_TOKEN (preferred; never committed)
+        #   2. legacy bot.env's DISPATCH_TOKEN (or TELEGRAM_DISPATCH_TOKEN) field
+        self.dispatch_token = os.environ.get("NOTIFY_BOT_DISPATCH_TOKEN") or \
+            legacy_env.get("DISPATCH_TOKEN") or \
+            legacy_env.get("TELEGRAM_DISPATCH_TOKEN") or ""
+        if not self.dispatch_token:
+            logger.warning(
+                "no dispatch_token configured — POST /dispatch will return 503. "
+                "Set NOTIFY_BOT_DISPATCH_TOKEN or TELEGRAM_DISPATCH_TOKEN in %s.",
+                LEGACY_ENV_PATH,
+            )
+        else:
+            logger.info("dispatch_token configured (length=%d); POST /dispatch enabled",
+                        len(self.dispatch_token))
+
         # Index
         for bot in bots:
             if bot.name in self.bots:
@@ -1370,6 +1491,175 @@ class MultiBotServer:
         if not bot_name:
             return None
         return self.bots.get(bot_name)
+
+    def find_bot_by_name(self, bot_name):
+        """Return the Bot registered under `bot_name`, or None.
+
+        Used by POST /dispatch where the caller names the bot explicitly
+        (rather than via a project_key like POST /notify does)."""
+        return self.bots.get(bot_name)
+
+    def dispatch(self, payload):
+        """Process one POST /dispatch payload from an upstream service
+        (e.g. ofelia-ui calling this server to send a reply back to
+        Telegram via the multi-bot registry).
+
+        payload shape (see references/setup.md in the telegramNotifications
+        repo for the full contract):
+
+          {
+            "bot":                 "<bot name in this server's registry>",
+            "chat_id":             int (overrides the bot's default chat_id),
+            "thread_id":           int or null (forum topic id),
+            "content": {
+              "type":              "text" | "edit" | "answer_callback"
+                                   | "photo" | "voice" | "document",
+              ...type-specific fields...
+            },
+            "reply_to_message_id": int (optional),
+            "inline_keyboard":     {"rows": [[{...}, ...]]} (optional),
+            "parse_mode":          "plain" | "html" (default "plain"),
+            "metadata":            dict (optional, echoed back as-is)
+          }
+
+        Returns a dict ready to be JSON-encoded as the HTTP response:
+          on success: {"ok": true, "telegram_message_id", "telegram_chat_id",
+                       "telegram_thread_id", "metadata"}
+          on failure: {"ok": false, "error_code", "retry_after_seconds"?,
+                       "metadata"}
+
+        Auth has already been verified by the caller (Handler._handle_dispatch).
+        """
+        meta = payload.get("metadata") or {}
+
+        bot_name = payload.get("bot") or ""
+        if not bot_name:
+            return {"ok": False, "error_code": "missing_bot", "metadata": meta}
+        bot = self.find_bot_by_name(bot_name)
+        if bot is None:
+            return {"ok": False, "error_code": "unknown_bot",
+                    "bot": bot_name, "metadata": meta}
+
+        target_chat_id = payload.get("chat_id") or bot.chat_id
+        target_thread_id = payload.get("thread_id")
+
+        content = payload.get("content") or {}
+        ctype = content.get("type") or ""
+        parse_mode = (payload.get("parse_mode") or "plain").lower()
+        if parse_mode == "http v1":
+            parse_mode = "html"
+        elif parse_mode == "plain" or parse_mode == "":
+            parse_mode = None
+
+        reply_markup = None
+        kb = payload.get("inline_keyboard")
+        if isinstance(kb, dict) and kb.get("rows"):
+            try:
+                reply_markup = {
+                    "inline_keyboard": [
+                        [{"text": btn.get("text", ""),
+                          "callback_data": btn.get("callback_data", "")}
+                         for btn in row]
+                        for row in kb["rows"]
+                    ]
+                }
+            except Exception as e:
+                logger.warning("malformed inline_keyboard, ignoring: %s", e)
+                reply_markup = None
+
+        # Temporarily swap chat_id for this dispatch call only. Restored in
+        # finally so concurrent dispatchers don't clobber each other.
+        original_chat_id = bot.chat_id
+        bot.chat_id = str(target_chat_id)
+        try:
+            try:
+                if ctype == "text":
+                    text = content.get("text") or ""
+                    if not text:
+                        return {"ok": False, "error_code": "missing_text",
+                                "metadata": meta}
+                    code, body = bot.send_message(
+                        text,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode,
+                        message_thread_id=target_thread_id,
+                    )
+                    mid = _tg_extract_message_id(body)
+                    if 200 <= code < 300:
+                        return {"ok": True, "telegram_message_id": mid,
+                                "telegram_chat_id": str(bot.chat_id),
+                                "telegram_thread_id": target_thread_id,
+                                "metadata": meta}
+                    err, retry = _parse_telegram_error(body)
+                    out = {"ok": False, "error_code": err or "telegram_error",
+                           "metadata": meta}
+                    if retry is not None:
+                        out["retry_after_seconds"] = retry
+                    return out
+
+                if ctype == "edit":
+                    mid_in = content.get("message_id")
+                    text = content.get("text") or ""
+                    if not mid_in or not text:
+                        return {"ok": False,
+                                "error_code": "missing_message_id_or_text",
+                                "metadata": meta}
+                    code, body, ok = edit_message_text(
+                        bot.bot_token, bot.chat_id, int(mid_in), text,
+                        reply_markup=reply_markup, parse_mode=parse_mode,
+                    )
+                    if ok:
+                        return {"ok": True, "telegram_message_id": int(mid_in),
+                                "telegram_chat_id": str(bot.chat_id),
+                                "telegram_thread_id": target_thread_id,
+                                "metadata": meta}
+                    err, retry = _parse_telegram_error(body)
+                    out = {"ok": False, "error_code": err or "telegram_error",
+                           "metadata": meta}
+                    if retry is not None:
+                        out["retry_after_seconds"] = retry
+                    return out
+
+                if ctype == "answer_callback":
+                    cb_id = content.get("callback_query_id") or ""
+                    alert_text = content.get("text") or ""
+                    show_alert = bool(content.get("show_alert", False))
+                    if not cb_id:
+                        return {"ok": False,
+                                "error_code": "missing_callback_query_id",
+                                "metadata": meta}
+                    payload_cb = {"callback_query_id": cb_id}
+                    if alert_text:
+                        payload_cb["text"] = alert_text[:200]
+                    payload_cb["show_alert"] = show_alert
+                    code, body = _tg_call_json(
+                        bot.bot_token, "answerCallbackQuery", payload_cb,
+                    )
+                    if 200 <= code < 300:
+                        return {"ok": True, "telegram_message_id": 0,
+                                "telegram_chat_id": str(bot.chat_id),
+                                "telegram_thread_id": target_thread_id,
+                                "metadata": meta}
+                    err, retry = _parse_telegram_error(body)
+                    out = {"ok": False, "error_code": err or "telegram_error",
+                           "metadata": meta}
+                    if retry is not None:
+                        out["retry_after_seconds"] = retry
+                    return out
+
+                if ctype in ("photo", "voice", "document"):
+                    return {"ok": False, "error_code": "unsupported_in_phase_0",
+                            "requested_type": ctype, "metadata": meta}
+
+                return {"ok": False, "error_code": "unknown_content_type",
+                        "content_type": ctype, "metadata": meta}
+            except Exception as e:
+                logger.exception("dispatch crashed for bot=%s type=%s: %s",
+                                 bot.name, ctype, e)
+                return {"ok": False, "error_code": "internal_error",
+                        "metadata": meta}
+        finally:
+            bot.chat_id = original_chat_id
 
     def health(self):
         bot_list = []
@@ -1494,6 +1784,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         server = self.server_ref
+        if path == "/dispatch":
+            self._handle_dispatch(server)
+            return
         if path != "/notify":
             self._send_json(404, {"error": "endpoint not found"})
             return
@@ -1531,6 +1824,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
         result = bot.handle_notify(payload)
         status = int(result.pop("_http_status", 200))
         self._send_json(status, result)
+
+    def _handle_dispatch(self, server):
+        """Handle POST /dispatch — ofelia-ui calls this to send replies
+        back to Telegram via the multi-bot registry."""
+        if server is None:
+            self._send_json(503, {"error": "server_not_initialized"})
+            return
+
+        expected = server.dispatch_token or ""
+        auth = self.headers.get("Authorization", "")
+        if not expected or not auth or auth != "Bearer %s" % expected:
+            self._send_json(401, {"error": "unauthorized"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode("utf-8") if length > 0 else ""
+            payload = json.loads(raw) if raw else {}
+        except (ValueError, json.JSONDecodeError):
+            self._send_json(400, {"error": "invalid json"})
+            return
+
+        if not isinstance(payload, dict):
+            self._send_json(400, {"error": "payload must be a JSON object"})
+            return
+
+        content = payload.get("content") or {}
+        if not isinstance(content, dict) or not content.get("type"):
+            self._send_json(400, {"error": "missing content.type"})
+            return
+
+        result = server.dispatch(payload)
+        # dispatch() never raises and always returns a JSON-friendly dict.
+        # Map failure codes to HTTP statuses (caller sees the raw error_code
+        # in the body for fine-grained handling).
+        if result.get("ok"):
+            self._send_json(200, result)
+            return
+        err = result.get("error_code") or ""
+        if err == "rate_limited":
+            self._send_json(429, result)
+        elif err in ("chat_not_found", "thread_not_found", "unknown_bot",
+                     "missing_bot"):
+            self._send_json(404, result)
+        elif err in ("missing_text", "missing_message_id_or_text",
+                     "missing_callback_query_id", "unknown_content_type",
+                     "unsupported_in_phase_0", "missing_content_type",
+                     "malformed_payload", "invalid_json"):
+            self._send_json(400, result)
+        elif err in ("forbidden", "bot_blocked"):
+            self._send_json(403, result)
+        else:
+            self._send_json(502, result)
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):

@@ -358,5 +358,271 @@ class TestFullMessageRespectsTopic(_ServerFixture):
                              "every sendMessage must carry message_thread_id=4")
 
 
+class TestDispatchAuth(unittest.TestCase):
+    """POST /dispatch requires Bearer auth matching server.dispatch_token.
+
+    The token is loaded from the env var NOTIFY_BOT_DISPATCH_TOKEN or from
+    the legacy bot.env (DISPATCH_TOKEN / TELEGRAM_DISPATCH_TOKEN). We use a
+    small stub server that doesn't need a token at all so we don't have to
+    plumb env vars through the test runner.
+    """
+
+    DISPATCH_TOKEN = "test-dispatch-secret"
+
+    def setUp(self):
+        # Stub _tg_call_json so the bot can send messages without hitting
+        # the Telegram API.
+        self.tg_calls = []
+        self._original_tg = notify_bot._tg_call_json
+
+        def fake_tg_call(token, method, payload_obj, timeout=10):
+            self.tg_calls.append({"token": token, "method": method,
+                                  "payload": dict(payload_obj)})
+            if method == "getUpdates":
+                return 200, json.dumps({"ok": True, "result": []})
+            return 200, json.dumps({"ok": True, "result": {
+                "message_id": 100, "chat": {"id": -1001234567890},
+            }})
+
+        notify_bot._tg_call_json = fake_tg_call
+
+        self.tmpdir = tempfile.mkdtemp(prefix="notify-bot-dispatch-")
+        with open(os.path.join(self.tmpdir, "alexandria_ofelia.env"), "w") as fh:
+            fh.write(
+                "BOT_TOKEN=TESTTOKEN-dispatch\n"
+                "PROJECT_KEY=ia_conversacional\n"
+                "CHAT_ID=8742621415\n"
+                "FULL_MODE=never\n"
+                "API_KEY=test-shared-secret\n"
+            )
+        # shared bot.env: API_KEY + DISPATCH_TOKEN
+        self.shared_env = os.path.join(
+            os.path.expanduser("~"), ".config", "notify-agent", "bot.env",
+        )
+        os.makedirs(os.path.dirname(self.shared_env), exist_ok=True)
+        self._had_shared = os.path.exists(self.shared_env)
+        if self._had_shared:
+            with open(self.shared_env) as fh:
+                self._shared_contents = fh.read()
+        with open(self.shared_env, "w") as fh:
+            fh.write(
+                "API_KEY=test-shared-secret\n"
+                "TELEGRAM_DISPATCH_TOKEN=%s\n" % self.DISPATCH_TOKEN
+            )
+
+        # Boot server (no_poll=True; only the HTTP endpoint is exercised)
+        self.port = 30000 + (os.getpid() % 5000)
+        self.server = notify_bot.MultiBotServer(bots_dir=self.tmpdir)
+        self.server.load_bots()
+        self.server.start("127.0.0.1", self.port, allow_public=False, no_poll=True)
+        self._http_thread = threading.Thread(
+            target=self.server._server.serve_forever,
+            daemon=True, name="test-dispatch",
+        )
+        self._http_thread.start()
+        time.sleep(0.2)
+
+    def tearDown(self):
+        try:
+            self.server._server.shutdown()
+        except Exception:
+            pass
+        try:
+            self.server._server.server_close()
+        except Exception:
+            pass
+        notify_bot._tg_call_json = self._original_tg
+        if self._had_shared:
+            with open(self.shared_env, "w") as fh:
+                fh.write(self._shared_contents)
+        else:
+            try:
+                os.unlink(self.shared_env)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _post_dispatch(self, payload, auth=None):
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if auth is not None:
+            headers["Authorization"] = auth
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/dispatch" % self.port,
+            data=body, headers=headers, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def _last_sendmessage_payload(self):
+        for call in reversed(self.tg_calls):
+            if call["method"] == "sendMessage":
+                return call["payload"]
+        return None
+
+    def test_missing_auth_returns_401(self):
+        status, body = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "hi"},
+        }, auth=None)
+        self.assertEqual(status, 401)
+        self.assertEqual(body.get("error"), "unauthorized")
+
+    def test_wrong_auth_returns_401(self):
+        status, body = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "hi"},
+        }, auth="Bearer wrong-token")
+        self.assertEqual(status, 401)
+
+    def test_correct_auth_text_delivers(self):
+        status, body = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "hello from test"},
+            "thread_id": None,
+            "metadata": {"session_id": "abc"},
+        }, auth="Bearer %s" % self.DISPATCH_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body.get("telegram_message_id"), 100)
+        self.assertEqual(body.get("metadata", {}).get("session_id"), "abc")
+        # Confirm the Telegram sendMessage call carried the right text.
+        payload = self._last_sendmessage_payload()
+        self.assertIn("hello from test", payload["text"])
+
+    def test_unknown_bot_returns_404(self):
+        status, body = self._post_dispatch({
+            "bot": "nope",
+            "content": {"type": "text", "text": "hi"},
+        }, auth="Bearer %s" % self.DISPATCH_TOKEN)
+        self.assertEqual(status, 404)
+        self.assertEqual(body.get("error_code"), "unknown_bot")
+
+    def test_text_with_inline_keyboard(self):
+        status, body = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "Confirma?"},
+            "inline_keyboard": {
+                "rows": [
+                    [{"text": "S\u00ed", "callback_data": "confirm:yes"},
+                     {"text": "No", "callback_data": "confirm:no"}],
+                ]
+            },
+        }, auth="Bearer %s" % self.DISPATCH_TOKEN)
+        self.assertEqual(status, 200)
+        payload = self._last_sendmessage_payload()
+        self.assertIn("reply_markup", payload)
+        kb = payload["reply_markup"]
+        self.assertEqual(len(kb["inline_keyboard"]), 1)
+        self.assertEqual(len(kb["inline_keyboard"][0]), 2)
+        self.assertEqual(kb["inline_keyboard"][0][0]["text"], "S\u00ed")
+
+    def test_edit_returns_ok(self):
+        status, body = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "edit", "message_id": 50, "text": "edited"},
+        }, auth="Bearer %s" % self.DISPATCH_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body.get("telegram_message_id"), 50)
+
+    def test_answer_callback_returns_ok(self):
+        status, body = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {
+                "type": "answer_callback",
+                "callback_query_id": "cb-123",
+                "text": "OK",
+                "show_alert": False,
+            },
+        }, auth="Bearer %s" % self.DISPATCH_TOKEN)
+        self.assertEqual(status, 200)
+        # Confirm the right Telegram API was called.
+        methods = [c["method"] for c in self.tg_calls]
+        self.assertIn("answerCallbackQuery", methods)
+
+    def test_unsupported_content_type_returns_400(self):
+        status, body = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "photo", "media_url": "https://x/y.jpg"},
+        }, auth="Bearer %s" % self.DISPATCH_TOKEN)
+        self.assertEqual(status, 400)
+        self.assertEqual(body.get("error_code"), "unsupported_in_phase_0")
+
+    def test_missing_content_type_returns_400(self):
+        status, body = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"text": "no type"},
+        }, auth="Bearer %s" % self.DISPATCH_TOKEN)
+        self.assertEqual(status, 400)
+        self.assertEqual(body.get("error"), "missing content.type")
+
+    def test_invalid_json_returns_400(self):
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/dispatch" % self.port,
+            data=b"{not json",
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer %s" % self.DISPATCH_TOKEN},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(cm.exception.code, 400)
+
+
+class TestDispatchToken(unittest.TestCase):
+    """Server refuses to dispatch if no token is configured (returns 503)."""
+
+    def setUp(self):
+        self._original_tg = notify_bot._tg_call_json
+
+        def fake_tg_call(token, method, payload_obj, timeout=10):
+            return 200, json.dumps({"ok": True, "result": {"message_id": 1}})
+
+        notify_bot._tg_call_json = fake_tg_call
+
+        self.tmpdir = tempfile.mkdtemp(prefix="notify-bot-notoken-")
+        with open(os.path.join(self.tmpdir, "alexandria_ofelia.env"), "w") as fh:
+            fh.write(
+                "BOT_TOKEN=TESTTOKEN\n"
+                "PROJECT_KEY=ia_conversacional\n"
+                "CHAT_ID=8742621415\n"
+                "API_KEY=test-shared-secret\n"
+            )
+        # shared bot.env with NO dispatch token
+        self.shared_env = os.path.join(
+            os.path.expanduser("~"), ".config", "notify-agent", "bot.env",
+        )
+        os.makedirs(os.path.dirname(self.shared_env), exist_ok=True)
+        self._had_shared = os.path.exists(self.shared_env)
+        if self._had_shared:
+            with open(self.shared_env) as fh:
+                self._shared_contents = fh.read()
+        with open(self.shared_env, "w") as fh:
+            fh.write("API_KEY=test-shared-secret\n")
+
+        self.server = notify_bot.MultiBotServer(bots_dir=self.tmpdir)
+        self.server.load_bots()
+        # Don't start() — just check that dispatch_token is empty.
+
+    def tearDown(self):
+        notify_bot._tg_call_json = self._original_tg
+        if self._had_shared:
+            with open(self.shared_env, "w") as fh:
+                fh.write(self._shared_contents)
+        else:
+            try:
+                os.unlink(self.shared_env)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_dispatch_token_empty_when_unset(self):
+        self.assertEqual(self.server.dispatch_token, "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
