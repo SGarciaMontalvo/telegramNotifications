@@ -938,5 +938,83 @@ class TestParseTelegramError(unittest.TestCase):
         self.assertIsNone(retry)
 
 
+class TestPollingEnabledFlag(unittest.TestCase):
+    """POLLING_ENABLED=false in .env skips the poller but keeps the bot
+    loadable (so /dispatch still works for that bot). Used when an
+    external webhook (e.g. ofelia-ui) is the sole handler for that bot's
+    chat and we still want this server to handle outbound dispatch."""
+
+    def setUp(self):
+        self._original_tg = notify_bot._tg_call_json
+
+        def fake_tg_call(token, method, payload_obj, timeout=10):
+            if method == "getUpdates":
+                return 200, json.dumps({"ok": True, "result": []})
+            return 200, json.dumps({"ok": True, "result": {"message_id": 1}})
+
+        notify_bot._tg_call_json = fake_tg_call
+
+        self.tmpdir = tempfile.mkdtemp(prefix="notify-bot-nopoll-")
+        with open(os.path.join(self.tmpdir, "alexandria_ofelia.env"), "w") as fh:
+            fh.write(
+                "BOT_TOKEN=TESTTOKEN\n"
+                "BOT_USERNAME=Ofelia_sgm_agent_bot\n"
+                "PROJECT_KEY=ia_conversacional\n"
+                "CHAT_ID=8742621415\n"
+                "FULL_MODE=always\n"
+                "POLLING_ENABLED=false\n"
+                "API_KEY=test-shared-secret\n"
+            )
+
+    def tearDown(self):
+        notify_bot._tg_call_json = self._original_tg
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_bot_loads_without_polling(self):
+        server = notify_bot.MultiBotServer(bots_dir=self.tmpdir)
+        server.load_bots()
+        self.assertIn("alexandria_ofelia", server.bots)
+        bot = server.bots["alexandria_ofelia"]
+        self.assertEqual(bot._polling_enabled_raw, "false")
+        # start_poller returns None immediately (no thread spawned).
+        self.assertIsNone(bot.start_poller())
+        # poller_thread was never set.
+        self.assertIsNone(bot.poller_thread)
+        # polling_active stays False.
+        self.assertFalse(bot.polling_active)
+
+    def test_polling_enabled_default_is_true(self):
+        # Same env without POLLING_ENABLED → bot has default "true".
+        with open(os.path.join(self.tmpdir, "other-bot.env"), "w") as fh:
+            fh.write(
+                "BOT_TOKEN=TESTTOKEN-OTHER\n"
+                "PROJECT_KEY=other\n"
+                "CHAT_ID=8742621415\n"
+                "API_KEY=test-shared-secret\n"
+            )
+        server = notify_bot.MultiBotServer(bots_dir=self.tmpdir)
+        server.load_bots()
+        bot = server.bots["other-bot"]
+        self.assertEqual(bot._polling_enabled_raw, "true")
+
+    def test_polling_enabled_accepts_truthy_aliases(self):
+        # 0 / no / off should also disable.
+        for value in ("0", "no", "off", "FALSE", "False"):
+            with open(os.path.join(self.tmpdir, f"bot-{value}.env"), "w") as fh:
+                fh.write(
+                    f"BOT_TOKEN=TESTTOKEN-{value}\n"
+                    f"PROJECT_KEY=p-{value}\n"
+                    f"CHAT_ID=8742621415\n"
+                    f"POLLING_ENABLED={value}\n"
+                    f"API_KEY=test-shared-secret\n"
+                )
+        server = notify_bot.MultiBotServer(bots_dir=self.tmpdir)
+        server.load_bots()
+        for value in ("0", "no", "off", "FALSE", "False"):
+            bot_name = f"bot-{value}"
+            self.assertIn(bot_name, server.bots)
+            self.assertIsNone(server.bots[bot_name].start_poller())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

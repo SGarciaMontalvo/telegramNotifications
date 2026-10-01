@@ -530,6 +530,11 @@ class Bot:
         if not self.bot_token:
             raise ValueError("%s: BOT_TOKEN missing" % env_path)
         self.api_key = env.get("API_KEY") or ""  # may be empty; server-wide key wins
+        # POLLING_ENABLED controls the long-poll loop. Default true. Set
+        # to "false" (or 0/no/off) to disable the poller while keeping
+        # the bot loaded for /dispatch. Useful when an external webhook
+        # (e.g. ofelia-ui) is the sole handler for that bot's chat.
+        self._polling_enabled_raw = (env.get("POLLING_ENABLED") or "true").strip().lower()
 
         # Optional / display
         self.bot_username = env.get("BOT_USERNAME") or ""
@@ -1002,6 +1007,22 @@ class Bot:
     def start_poller(self):
         if not self.bot_token:
             logger.warning("bot %r: no BOT_TOKEN, skipping poller", self.name)
+            return None
+        # POLLING_ENABLED=false in the .env disables the long-poll loop for
+        # this bot. The bot stays loaded for /dispatch and /health but
+        # receives no inbound updates on its own — an external service
+        # (e.g. ofelia-ui with a webhook) is expected to handle the chat
+        # side and call /dispatch to send replies. Backward-compatible:
+        # absent or any value other than the exact lowercase string "false"
+        # (or "0", "no", "off") keeps the poller on.
+        polling_flag_raw = getattr(self, "_polling_enabled_raw", "true")
+        if polling_flag_raw in ("false", "0", "no", "off"):
+            logger.info(
+                "bot %r: POLLING_ENABLED=%s in .env — poller disabled "
+                "(this bot only serves /dispatch; inbound updates must be "
+                "handled by an external webhook)",
+                self.name, polling_flag_raw,
+            )
             return None
         self._stop_event.clear()
         t = threading.Thread(
