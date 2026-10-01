@@ -624,5 +624,319 @@ class TestDispatchToken(unittest.TestCase):
         self.assertEqual(self.server.dispatch_token, "")
 
 
+# ---------------------------------------------------------------------------
+# Telegram-error simulation. Same scaffolding as TestDispatchAuth, but with
+# a programmable fake_tg_call that returns whatever the test wants.
+# ---------------------------------------------------------------------------
+
+class _ProgrammableTelegramServerFixture(unittest.TestCase):
+    """Boots a notify-bot server pointing at a fake Telegram API whose
+    responses are programmable per test (via `set_tg_response`)."""
+
+    DISPATCH_TOKEN = "test-dispatch-secret"
+
+    def setUp(self):
+        self.tg_calls = []
+        self._original_tg = notify_bot._tg_call_json
+
+        # Default: a success response. Tests override per-method.
+        self._tg_responses = {}
+
+        def fake_tg_call(token, method, payload_obj, timeout=10):
+            self.tg_calls.append({"token": token, "method": method,
+                                  "payload": dict(payload_obj)})
+            if method == "getUpdates":
+                return 200, json.dumps({"ok": True, "result": []})
+            # Default OK for the rest, overridable per-method.
+            if method in self._tg_responses:
+                return self._tg_responses[method]
+            return 200, json.dumps({"ok": True, "result": {
+                "message_id": 100, "chat": {"id": 8742621415},
+            }})
+
+        notify_bot._tg_call_json = fake_tg_call
+
+        self.tmpdir = tempfile.mkdtemp(prefix="notify-bot-prog-")
+        with open(os.path.join(self.tmpdir, "alexandria_ofelia.env"), "w") as fh:
+            fh.write(
+                "BOT_TOKEN=TESTTOKEN-dispatch-prog\n"
+                "PROJECT_KEY=ia_conversacional\n"
+                "CHAT_ID=8742621415\n"
+                "FULL_MODE=never\n"
+                "API_KEY=test-shared-secret\n"
+            )
+        self.shared_env = os.path.join(
+            os.path.expanduser("~"), ".config", "notify-agent", "bot.env",
+        )
+        os.makedirs(os.path.dirname(self.shared_env), exist_ok=True)
+        self._had_shared = os.path.exists(self.shared_env)
+        if self._had_shared:
+            with open(self.shared_env) as fh:
+                self._shared_contents = fh.read()
+        with open(self.shared_env, "w") as fh:
+            fh.write(
+                "API_KEY=test-shared-secret\n"
+                "TELEGRAM_DISPATCH_TOKEN=%s\n" % self.DISPATCH_TOKEN
+            )
+
+        self.port = 31000 + (os.getpid() % 5000)
+        self.server = notify_bot.MultiBotServer(bots_dir=self.tmpdir)
+        self.server.load_bots()
+        self.server.start("127.0.0.1", self.port, allow_public=False, no_poll=True)
+        self._http_thread = threading.Thread(
+            target=self.server._server.serve_forever,
+            daemon=True, name="test-prog",
+        )
+        self._http_thread.start()
+        time.sleep(0.2)
+
+    def tearDown(self):
+        try:
+            self.server._server.shutdown()
+        except Exception:
+            pass
+        try:
+            self.server._server.server_close()
+        except Exception:
+            pass
+        notify_bot._tg_call_json = self._original_tg
+        if self._had_shared:
+            with open(self.shared_env, "w") as fh:
+                fh.write(self._shared_contents)
+        else:
+            try:
+                os.unlink(self.shared_env)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def set_tg_response(self, method, code, body):
+        self._tg_responses[method] = (code, body)
+
+    def _post_dispatch(self, payload):
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/dispatch" % self.port,
+            data=body,
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer %s" % self.DISPATCH_TOKEN},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+
+class TestDispatchRateLimit(_ProgrammableTelegramServerFixture):
+    def test_telegram_429_passes_through_with_retry_after(self):
+        # Telegram returns 429 with retry_after in the parameters block.
+        body = json.dumps({
+            "ok": False,
+            "error_code": 429,
+            "description": "Too Many Requests: retry after 30",
+            "parameters": {"retry_after": 30},
+        })
+        self.set_tg_response("sendMessage", 429, body)
+        status, resp = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "spam"},
+        })
+        self.assertEqual(status, 429)
+        self.assertFalse(resp.get("ok"))
+        self.assertEqual(resp.get("error_code"), "rate_limited")
+        self.assertEqual(resp.get("retry_after_seconds"), 30)
+
+
+class TestDispatchBotBlocked(_ProgrammableTelegramServerFixture):
+    def test_bot_blocked_returns_403(self):
+        body = json.dumps({
+            "ok": False,
+            "error_code": 403,
+            "description": "Forbidden: bot was blocked by the user",
+        })
+        self.set_tg_response("sendMessage", 403, body)
+        status, resp = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "blocked"},
+        })
+        self.assertEqual(status, 403)
+        self.assertEqual(resp.get("error_code"), "bot_blocked")
+
+
+class TestDispatchChatNotFound(_ProgrammableTelegramServerFixture):
+    def test_chat_not_found_returns_404(self):
+        body = json.dumps({
+            "ok": False,
+            "error_code": 400,
+            "description": "Bad Request: chat not found",
+        })
+        self.set_tg_response("sendMessage", 400, body)
+        status, resp = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "where?"},
+        })
+        self.assertEqual(status, 404)
+        self.assertEqual(resp.get("error_code"), "chat_not_found")
+
+
+class TestDispatchMessageTooLong(_ProgrammableTelegramServerFixture):
+    def test_message_too_long_returns_502(self):
+        body = json.dumps({
+            "ok": False,
+            "error_code": 400,
+            "description": "Bad Request: message text is too long",
+        })
+        self.set_tg_response("sendMessage", 400, body)
+        status, resp = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "x" * 5000},
+        })
+        self.assertEqual(status, 502)
+        self.assertEqual(resp.get("error_code"), "message_too_long")
+
+
+class TestDispatchPayloadEdges(_ProgrammableTelegramServerFixture):
+    def test_huge_text_payload(self):
+        """Server should handle long text without crashing. Telegram's text
+        limit is 4096 chars; we send 3000 to stay within bounds but still
+        exercise the path."""
+        status, resp = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "x" * 3000},
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(resp.get("telegram_message_id"), 100)
+
+    def test_metadata_echo(self):
+        meta = {"session_id": "xyz", "origin": "ofelia", "k": "v"}
+        status, resp = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "text", "text": "hi"},
+            "metadata": meta,
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(resp.get("metadata"), meta)
+
+    def test_unknown_content_type_returns_400(self):
+        status, resp = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "content": {"type": "video", "media_url": "..."},
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(resp.get("error_code"), "unknown_content_type")
+
+    def test_chat_id_override_uses_payload_chat(self):
+        """If the caller specifies chat_id in the body, the dispatch goes
+        to that chat_id instead of the bot's default chat_id."""
+        status, resp = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "chat_id": -1001234567890,
+            "content": {"type": "text", "text": "override"},
+        })
+        self.assertEqual(status, 200)
+        # Check the captured Telegram call hit the override chat_id.
+        send_payload = next(c["payload"] for c in self.tg_calls
+                            if c["method"] == "sendMessage")
+        self.assertEqual(str(send_payload["chat_id"]), "-1001234567890")
+        self.assertEqual(resp.get("telegram_chat_id"), "-1001234567890")
+        # And that the bot's stored chat_id was NOT mutated permanently.
+        bot = self.server.bots["alexandria_ofelia"]
+        self.assertEqual(bot.chat_id, "8742621415")
+
+    def test_thread_id_passes_through(self):
+        status, resp = self._post_dispatch({
+            "bot": "alexandria_ofelia",
+            "thread_id": 42,
+            "content": {"type": "text", "text": "hi topic 42"},
+        })
+        self.assertEqual(status, 200)
+        send_payload = next(c["payload"] for c in self.tg_calls
+                            if c["method"] == "sendMessage")
+        self.assertEqual(send_payload.get("message_thread_id"), 42)
+        self.assertEqual(resp.get("telegram_thread_id"), 42)
+
+
+class TestParseTelegramError(unittest.TestCase):
+    """Unit tests for _parse_telegram_error covering all known shapes."""
+
+    def test_rate_limited_from_retry_after_param(self):
+        body = json.dumps({
+            "ok": False,
+            "description": "Too Many Requests",
+            "parameters": {"retry_after": 5},
+        })
+        code, retry = notify_bot._parse_telegram_error(body)
+        self.assertEqual(code, "rate_limited")
+        self.assertEqual(retry, 5)
+
+    def test_rate_limited_from_description(self):
+        body = json.dumps({
+            "ok": False,
+            "description": "too many requests right now",
+        })
+        code, retry = notify_bot._parse_telegram_error(body)
+        self.assertEqual(code, "rate_limited")
+        self.assertIsNone(retry)
+
+    def test_chat_not_found(self):
+        body = json.dumps({"ok": False,
+                           "description": "Bad Request: chat not found"})
+        code, _ = notify_bot._parse_telegram_error(body)
+        self.assertEqual(code, "chat_not_found")
+
+    def test_thread_not_found(self):
+        body = json.dumps({"ok": False,
+                           "description": "Bad Request: message thread not found"})
+        code, _ = notify_bot._parse_telegram_error(body)
+        self.assertEqual(code, "thread_not_found")
+
+    def test_message_too_long(self):
+        body = json.dumps({"ok": False,
+                           "description": "Bad Request: message is too long"})
+        code, _ = notify_bot._parse_telegram_error(body)
+        self.assertEqual(code, "message_too_long")
+
+    def test_bot_blocked(self):
+        body = json.dumps({"ok": False,
+                           "description": "Forbidden: bot was blocked by the user"})
+        code, _ = notify_bot._parse_telegram_error(body)
+        self.assertEqual(code, "bot_blocked")
+
+    def test_bot_kicked(self):
+        body = json.dumps({"ok": False,
+                           "description": "Forbidden: bot was kicked from the group"})
+        code, _ = notify_bot._parse_telegram_error(body)
+        self.assertEqual(code, "bot_blocked")
+
+    def test_generic_forbidden(self):
+        body = json.dumps({"ok": False,
+                           "description": "Forbidden: something else"})
+        code, _ = notify_bot._parse_telegram_error(body)
+        self.assertEqual(code, "forbidden")
+
+    def test_bad_request_fallback(self):
+        body = json.dumps({"ok": False,
+                           "description": "Bad Request: some unrecognised thing"})
+        code, _ = notify_bot._parse_telegram_error(body)
+        self.assertEqual(code, "bad_request")
+
+    def test_ok_body_returns_none(self):
+        body = json.dumps({"ok": True, "result": {}})
+        code, _ = notify_bot._parse_telegram_error(body)
+        self.assertIsNone(code)
+
+    def test_invalid_json_returns_telegram_error(self):
+        code, retry = notify_bot._parse_telegram_error("not json")
+        self.assertEqual(code, "telegram_error")
+        self.assertIsNone(retry)
+
+    def test_empty_body_returns_telegram_error(self):
+        code, retry = notify_bot._parse_telegram_error("")
+        self.assertEqual(code, "telegram_error")
+        self.assertIsNone(retry)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
